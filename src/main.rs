@@ -15,16 +15,20 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Parser, Debug)] 
-#[command(author, version, about = "subdomain scanner BETA", long_about = None)]
+#[command(author, version, about = "subdomain-scan BETA", long_about = None)]
 struct Args {
+    /// Target root domain
     #[arg(short, long)]
     domain: String,
 
+    /// Path to the wordlist file
     #[arg(short, long)]
     wordlist: String,
 
+    /// Number of concurrent tasks/lookups
     #[arg(short, long, default_value_t = 50)]
     threads: usize,
 }
@@ -133,7 +137,7 @@ async fn main() {
     let wildcard_ips: HashSet<IpAddr> = ctx.detect_wildcard().await;
     let wildcard_ips_shared = Arc::new(wildcard_ips);
 
-    let lookups = stream::iter(ctx.wordlist).map(|subdomain| {
+    let lookups = stream::iter(ctx.wordlist.clone()).map(|subdomain| {
         let r = ctx.resolver.clone();
         let target = format!("{}.{}", subdomain, ctx.domain);
 
@@ -165,24 +169,42 @@ async fn main() {
     let mut stream = lookups.buffer_unordered(ctx.threads);
     let mut found_flag = false;
 
+    let total_tasks = ctx.wordlist.len() as u64;
+    let pb = ProgressBar::new(total_tasks);
+
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) | {per_sec}"
+        )
+        .unwrap()
+        .progress_chars("##-")
+    );
+
     while let Some((domain, res_ip, is_wild, is_cdn)) = stream.next().await {
+        pb.inc(1);
+        
         if is_wild { continue; }
 
         if let Ok(ips) = res_ip  {
             found_flag = true;
+
             let ip_list: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
+
             let colored_ips = ip_list.iter()
             .map(|ip| ip.green().to_string())
             .collect::<Vec<String>>()
             .join(&" | ".white().to_string());
-            println!("{} {:<25} -> {}[{}]", 
+
+            pb.println(format!("{} {:<25} -> {}[{}]", 
                 "[+]".green(), 
                 domain, 
                 if is_cdn { "[CDN] ".yellow() } else { "".normal() }, 
                 colored_ips
-            );
+            ));
         }
     }
 
-    if !found_flag { println!("No subdomain found.") }
+    pb.finish_and_clear();
+
+    if !found_flag { println!("{}", "No subdomain found.".red()) }
 }

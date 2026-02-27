@@ -11,3 +11,4 @@ hickory-resolver = {version = "0.25.2", features = ["tokio", "system-config"]}
 tokio = "1.49.0"
 clap = { version = "4", features = ["derive"] }
 colored = "3.1.1"
+indicatif = "0.18.4"
