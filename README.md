@@ -19,6 +19,10 @@ cargo build --release
 
 生成的二进制文件位于 ./target/release/subdomain-scan
 
+本项目带有测试用字典, 其来源于 **SecLists**
+
+ 感谢 [Daniel Miessler](https://github.com/danielmiessler) 维护的开源项目 **SecLists**: [https://github.com/danielmiessler/SecLists](https://github.com/danielmiessler/SecLists)
+
 ## Usage
 
 命令行参数:
@@ -33,4 +37,21 @@ Options:
   -h, --help                 Print help
   -V, --version              Print version
 ```
+
+## Example
+
+```bash
+subdomain-scan -d example.com -w  ./dict/subdomains-dict.txt
+
+[+] www.example.com           -> [104.18.27.120 | 104.18.26.120]
+```
+
+## Powered by
+
+- [tokio](https://github.com/tokio-rs/tokio)
+- [hickory-dns](https://github.com/hickory-dns/hickory-dns)
+- [indicatif](https://github.com/console-rs/indicatif)
+- [colored](https://github.com/colored-rs/colored)
+- [clap](https://github.com/clap-rs/clap)
+- [futures](https://github.com/rust-lang/futures-rs)
 
