@@ -29,7 +29,7 @@ struct Args {
     wordlist: String,
 
     /// Number of concurrent tasks/lookups
-    #[arg(short, long, default_value_t = 50)]
+    #[arg(short, long, default_value_t = 500)]
     threads: usize,
 }
 
@@ -51,12 +51,12 @@ pub struct AppContext {
     pub domain: String,
     pub wordlist: Vec<String>,
     pub threads: usize,
-    pub resolver: Resolver<TokioConnectionProvider>,
+    pub resolvers: Vec<Resolver<TokioConnectionProvider>>,
     pub cdn_cnames: Arc<Vec<String>>
 }
 
 impl AppContext {
-    pub fn build() -> Result<Self, Box<dyn Error>> {
+    pub async fn build() -> Result<(Self, Vec<&'static str>), Box<dyn Error>> {
         let cdn_cnames = vec![
             "cloudflare.net", "cloudflare.com",
             "cloudfront.net",
@@ -75,37 +75,90 @@ impl AppContext {
             return Err("Dictory empty".into());
         }
 
-        let mut config = ResolverConfig::new();
-        config.add_name_server(NameServerConfig::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)), 53),
-            Protocol::Udp
-        ));
+        let dns_servers = vec![
+            ("Ali-DNS", (223, 5, 5, 5)),
+            ("Tencent-Dns", (119, 29, 29, 29)),
+            ("114-DNS", (114, 114, 114, 114)),
+            ("Google", (8, 8, 8, 8)),
+            ("CloudFlare", (1, 1, 1, 1)),
+            ("Quad9", (9, 9, 9, 9)),
+            ("Baidu-DNS", (180, 76, 76, 76))
+        ];
 
-        let mut options = ResolverOpts::default();
-        options.timeout = Duration::from_secs(2);
-        options.attempts = 1;
+        let mut resolvers_tmp = Vec::new();
 
-        let resolver = Resolver::builder_with_config(
-            config,
-            TokioConnectionProvider::default()
-        )
-        .with_options(options)
-        .build();
+        for (s, (a, b, c, d)) in dns_servers {
+            let mut config = ResolverConfig::new();
+            config.add_name_server(NameServerConfig::new(
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), 53),
+                Protocol::Udp
+            ));
 
-        Ok(Self {
+            let mut options = ResolverOpts::default();
+            options.timeout = Duration::from_millis(1000);
+            options.attempts = 1;
+
+            let resolver = Resolver::builder_with_config(
+                config,
+                TokioConnectionProvider::default()
+            )
+            .with_options(options)
+            .build();
+
+            resolvers_tmp.push((s, resolver));
+        }
+        
+        let cheak_stream = stream::iter(resolvers_tmp).map(|(s, r)| {
+            async move {
+                let start = std::time::Instant::now();
+                match r.lookup_ip("example.com").await {
+                    Ok(_) => {
+                        let elapsed = start.elapsed();
+                        if elapsed.as_millis() > 150 {
+                            None
+                        } else {
+                            Some((s, r))
+                        }
+                    },
+                    Err(_) => {
+                        None
+                    }
+                }
+            }
+        });
+
+        let mut resolvers = Vec::new();
+        let mut active_dns = Vec::new();
+        let mut results = cheak_stream.buffer_unordered(8);
+
+        while let Some(res) = results.next().await {
+            if let Some((s, r)) = res {
+                resolvers.push(r);
+                active_dns.push(s);
+            }
+        }
+
+        if active_dns.is_empty() {
+            return Err("No DNS Server is aviliable now! Check your network.".into());
+        }
+
+        Ok((
+            Self {
             domain: args.domain,
             wordlist,
             threads: args.threads,
-            resolver,
+            resolvers,
             cdn_cnames: Arc::new(cdn_cnames),
-        })
+            },
+            active_dns
+        ))
     }
 
     pub async fn detect_wildcard(&self) -> HashSet<IpAddr> {
         let mut wildcard_ips: HashSet<IpAddr> = HashSet::new();
         let fake_domain = format!("this-is-fake-wildcard-test-999.{}", self.domain);
 
-        if let Ok(ips) = self.resolver.lookup_ip(&fake_domain).await {
+        if let Ok(ips) = self.resolvers[0].lookup_ip(&fake_domain).await {
             for ip in ips.iter() {
                 wildcard_ips.insert(ip);
             }
@@ -120,28 +173,42 @@ impl AppContext {
 #[tokio::main]
 async fn main() {
 
-    let ctx = match AppContext::build() {
-        Ok(c) => c,
+    let (ctx, dns_servers) = match AppContext::build().await {
+        Ok(res) => res,
         Err(e) => {
             println!("Inition failed: {}", e);
             std::process::exit(1);
         }
     };
 
-    if let Err(e) = ctx.resolver.lookup_ip("www.baidu.com").await {
-        println!("DNS lookup failed: {}", e);
-        println!("Please check your network setting.");
-        std::process::exit(1);
-    }
-
     let wildcard_ips: HashSet<IpAddr> = ctx.detect_wildcard().await;
     let wildcard_ips_shared = Arc::new(wildcard_ips);
 
-    let lookups = stream::iter(ctx.wordlist.clone()).map(|subdomain| {
-        let r = ctx.resolver.clone();
-        let target = format!("{}.{}", subdomain, ctx.domain);
+    let total_tasks = ctx.wordlist.len() as u64;
+    let pb = ProgressBar::new(total_tasks);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) | {per_sec}"
+        )
+        .unwrap()
+        .progress_chars("##-")
+    );
+    pb.println(format!("Available DNS servers: {}", dns_servers.join(", ").green()));
 
-        let cdn_list = Arc::clone(&ctx.cdn_cnames);
+    let AppContext {
+        domain,
+        wordlist,
+        threads,
+        resolvers,
+        cdn_cnames,
+    } = ctx;
+
+    let pool_size = resolvers.len();
+    let lookups = stream::iter(wordlist.into_iter().enumerate()).map(move |(index, subdomain)| {
+        let r = resolvers[index%pool_size].clone();
+        let target = format!("{}.{}", subdomain, domain);
+
+        let cdn_list = Arc::clone(&cdn_cnames);
         let wildcard = Arc::clone(&wildcard_ips_shared);
 
         async move {
@@ -166,19 +233,8 @@ async fn main() {
         }
     });
 
-    let mut stream = lookups.buffer_unordered(ctx.threads);
+    let mut stream = lookups.buffer_unordered(threads);
     let mut found_flag = false;
-
-    let total_tasks = ctx.wordlist.len() as u64;
-    let pb = ProgressBar::new(total_tasks);
-
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) | {per_sec}"
-        )
-        .unwrap()
-        .progress_chars("##-")
-    );
 
     while let Some((domain, res_ip, is_wild, is_cdn)) = stream.next().await {
         pb.inc(1);
@@ -188,10 +244,8 @@ async fn main() {
         if let Ok(ips) = res_ip  {
             found_flag = true;
 
-            let ip_list: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
-
-            let colored_ips = ip_list.iter()
-            .map(|ip| ip.green().to_string())
+            let colored_ips = ips.iter()
+            .map(|ip| ip.to_string().green().to_string())
             .collect::<Vec<String>>()
             .join(&" | ".white().to_string());
 
