@@ -29,12 +29,12 @@ cargo build --release
 命令行参数:
 
 ```
-Usage: subdomain-scan [OPTIONS] --domain <DOMAIN> --wordlist <WORDLIST>
+Usage: subdmain-scan [OPTIONS] --domain <DOMAIN> --wordlist <WORDLIST>
 
 Options:
   -d, --domain <DOMAIN>      Target root domain
   -w, --wordlist <WORDLIST>  Path to the wordlist file
-  -t, --threads <THREADS>    Number of concurrent tasks/lookups [default: 50]
+  -t, --threads <THREADS>    Number of concurrent tasks/lookups [default: 500]
   -h, --help                 Print help
   -V, --version              Print version
 ```
@@ -42,9 +42,12 @@ Options:
 ## Example
 
 ```bash
-subdomain-scan -d example.com -w  ./dict/subdomains-dict.txt
+subdmain-scan -d example.com -w ./dict.txt
 
-[+] www.example.com           -> [104.18.27.120 | 104.18.26.120]
+[*] InitInitializing...
+Available DNS servers: Ali-DNS, Baidu-DNS, 114-DNS, Tencent-Dns, CloudFlare
+[+] www.example.com           -> [104.18.26.120 | 104.18.27.120]
+The suspected wildcard DNS subdomain is stored in wildcard_suspects.txt.
 ```
 
 ## Powered by

@@ -1,21 +1,21 @@
-use futures::io;
-use hickory_proto::rr::record_type::RecordType;
-use hickory_resolver::config::*;
-use hickory_resolver::Resolver;
-use hickory_resolver::name_server::TokioConnectionProvider;
+use std::ops::Deref;
 use std::time::Duration;
-use futures::stream::{self, StreamExt};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use hickory_proto::xfer::Protocol;
-use std::path::Path;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use clap::Parser;
 use std::collections::HashSet;
 use std::error::Error;
 use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::fmt;
+use hickory_proto::{rr::record_type::RecordType, xfer::Protocol};
+use hickory_resolver::{config::*, Resolver, name_server::TokioConnectionProvider};
+use futures::{stream::{self, StreamExt}, io};
+use clap::Parser;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use rand::distr::{Alphanumeric, SampleString};
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 #[derive(Parser, Debug)] 
 #[command(author, version, about = "subdomain-scan BETA", long_about = None)]
@@ -45,6 +45,84 @@ fn wordlist_load<T: AsRef<Path>>(filename: T) -> io::Result<Vec<String>> {
         }
     }
     Ok(wordlist)
+}
+
+async fn detect_wildcard(resolvers: &[Resolver<TokioConnectionProvider>], domain: &str) -> HashSet<Subnet> {
+        let mut tasks = Vec::new();
+        for _ in 0..5 {
+            let fake_sub = Alphanumeric.sample_string(&mut rand::rng(), 8);
+            let fake_domain = format!("{}.{}", fake_sub, domain);
+
+            for resolver in resolvers {
+                tasks.push((resolver, fake_domain.clone()));
+
+            }
+        }
+
+        let lookups = stream::iter(tasks).map(|(r, d)| {
+            async move {
+                let mut subnets = Vec::new();
+                if let Ok(ips) = r.lookup_ip(&d).await {
+                    for ip in ips.iter() {
+                        subnets.push(Subnet::from_ip(&ip));
+                    }
+                }
+
+                if let Ok(ipv6s) = r.lookup(&d, RecordType::AAAA).await {
+                    for ipv6 in ipv6s.iter() {
+                        if let Some(ipv6) = ipv6.as_aaaa() {
+                            subnets.push(Subnet::from_ip(&ipv6.0.into()));
+                        }
+                    }
+                }
+                subnets
+            }
+        });
+
+        let mut streams = lookups.buffer_unordered(80);
+        let mut wildcard_ips: HashSet<Subnet> = HashSet::new();
+
+        while let Some(subnets) = streams.next().await {
+            for subnet in subnets {
+                wildcard_ips.insert(subnet);
+            }
+        }
+
+        wildcard_ips
+}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+pub enum Subnet {
+    V4([u8; 3]),
+    V6([u16; 4])
+}
+
+impl Subnet {
+    pub fn from_ip(ip: &IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(ip) => {
+                let ip_parts = ip.octets();
+                Subnet::V4([ip_parts[0], ip_parts[1], ip_parts[2]])
+            },
+            IpAddr::V6(ip) => {
+                let ip_parts = ip.segments();
+                Subnet::V6([ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3]])
+            }
+        }
+    }
+}
+
+impl fmt::Display for Subnet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Subnet::V4(parts) => {
+                write!(f, "{}.{}.{}.0/24", parts[0], parts[1], parts[2])
+            }
+            Subnet::V6(parts) => {
+                write!(f, "{:x}:{:x}:{:x}:{:x}::/64", parts[0], parts[1], parts[2], parts[3])
+            }
+        }
+    }
 }
 
 pub struct AppContext {
@@ -95,8 +173,8 @@ impl AppContext {
             ));
 
             let mut options = ResolverOpts::default();
-            options.timeout = Duration::from_millis(1000);
-            options.attempts = 1;
+            options.timeout = Duration::from_millis(1200);
+            options.attempts = 2;
 
             let resolver = Resolver::builder_with_config(
                 config,
@@ -154,24 +232,13 @@ impl AppContext {
         ))
     }
 
-    pub async fn detect_wildcard(&self) -> HashSet<IpAddr> {
-        let mut wildcard_ips: HashSet<IpAddr> = HashSet::new();
-        let fake_domain = format!("this-is-fake-wildcard-test-999.{}", self.domain);
-
-        if let Ok(ips) = self.resolvers[0].lookup_ip(&fake_domain).await {
-            for ip in ips.iter() {
-                wildcard_ips.insert(ip);
-            }
-        }
-
-        wildcard_ips
-    }
 }
 
 
 
 #[tokio::main]
 async fn main() {
+    println!("{} InitInitializing...", "[*]".blue());
 
     let (ctx, dns_servers) = match AppContext::build().await {
         Ok(res) => res,
@@ -181,20 +248,6 @@ async fn main() {
         }
     };
 
-    let wildcard_ips: HashSet<IpAddr> = ctx.detect_wildcard().await;
-    let wildcard_ips_shared = Arc::new(wildcard_ips);
-
-    let total_tasks = ctx.wordlist.len() as u64;
-    let pb = ProgressBar::new(total_tasks);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) | {per_sec}"
-        )
-        .unwrap()
-        .progress_chars("##-")
-    );
-    pb.println(format!("Available DNS servers: {}", dns_servers.join(", ").green()));
-
     let AppContext {
         domain,
         wordlist,
@@ -203,7 +256,30 @@ async fn main() {
         cdn_cnames,
     } = ctx;
 
+    let total_tasks = wordlist.len() as u64;
+    let pb = ProgressBar::new(total_tasks);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} ({eta}) | {per_sec}"
+        )
+        .unwrap()
+        .progress_chars("#>-")
+    );
+
+    let wildcard_ips: HashSet<Subnet> = detect_wildcard(&resolvers.deref(), &domain).await;
+    if !wildcard_ips.is_empty() {
+        println!("{} Wildcard IPs:", "[!]".yellow());
+        
+        for subnet in &wildcard_ips {
+            println!("    - {}", subnet.to_string().yellow()); 
+        }
+    }
+    pb.println(format!("Available DNS servers: {}", dns_servers.join(", ").green()));
+
+
+    let wildcard_ips_shared = Arc::new(wildcard_ips);
     let pool_size = resolvers.len();
+
     let lookups = stream::iter(wordlist.into_iter().enumerate()).map(move |(index, subdomain)| {
         let r = resolvers[index%pool_size].clone();
         let target = format!("{}.{}", subdomain, domain);
@@ -217,14 +293,15 @@ async fn main() {
 
             let res_ip = r.lookup_ip(target.clone()).await;
 
-            if let Ok(ips) = res_ip.clone() {
-                is_wild = ips.iter().any(|ip| wildcard.contains(&ip));
+            if let Ok(ips) = res_ip.as_ref() {
+                is_wild = ips.iter().any(|ip| wildcard.contains(&Subnet::from_ip(&ip)));
             }
 
             if !is_wild {
                 if let Ok(res_cname) = r.lookup(target.clone(), RecordType::CNAME).await {
                     is_cdn = res_cname.iter().any(|cname| {
-                        cdn_list.iter().any(|cdn_cname| cname.to_string().contains(cdn_cname) )
+                        let cname = cname.to_string();
+                        cdn_list.iter().any(|cdn_cname| cname.contains(cdn_cname) )
                     });
                 }
             }
@@ -236,12 +313,20 @@ async fn main() {
     let mut stream = lookups.buffer_unordered(threads);
     let mut found_flag = false;
 
+    let suspect_file = tokio::fs::File::create("wildcard_suspects.txt").await.expect("Failed to create wildcard file");
+    let mut suspect_writer = BufWriter::new(suspect_file);
+
     while let Some((domain, res_ip, is_wild, is_cdn)) = stream.next().await {
         pb.inc(1);
-        
-        if is_wild { continue; }
 
         if let Ok(ips) = res_ip  {
+            if is_wild {
+                let ip_strs = ips.iter().map(|ip| ip.to_string()).collect::<Vec<_>>().join(",");
+                let line = format!("{} [{}]\n", domain, ip_strs);
+                    
+                suspect_writer.write_all(line.as_bytes()).await.unwrap();
+                continue;
+            }
             found_flag = true;
 
             let colored_ips = ips.iter()
@@ -258,7 +343,8 @@ async fn main() {
         }
     }
 
+    pb.println("The suspected wildcard DNS subdomain is stored in wildcard_suspects.txt.".blue().to_string());
     pb.finish_and_clear();
 
-    if !found_flag { println!("{}", "No subdomain found.".red()) }
+    if !found_flag { println!("{}", "No subdomains discovered, or all resolved to wildcard IPs. ".red()) }
 }
